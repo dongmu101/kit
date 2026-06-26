@@ -1,3 +1,3 @@
 module github.com/dongmu101/kit
 
-go 1.25
+go 1.23
