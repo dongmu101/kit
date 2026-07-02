@@ -4,9 +4,15 @@ import (
 	"container/heap"
 	"context"
 	"fmt"
+	"os"
+	"reflect"
+	"runtime"
+	"runtime/debug"
 	"sync"
 	"time"
 )
+
+const minRecurringDuration = time.Millisecond
 
 type (
 	event struct {
@@ -28,12 +34,13 @@ type (
 	// 定时时间精确到秒，不精确管理goroutine的退出
 	// 主要逻辑只不过是对标准库Timer、Ticker封装管理而已
 	Schedule struct {
-		IDGen        uint64
+		idGen        uint64
 		mutex        sync.Mutex
 		events       map[uint64]*event
 		heap         eventHeap
 		intervalTime time.Duration
 		wakeup       chan struct{}
+		handlerLimit chan struct{}
 	}
 )
 
@@ -42,6 +49,7 @@ func NewSchedule() *Schedule {
 		events:       make(map[uint64]*event),
 		intervalTime: time.Second,
 		wakeup:       make(chan struct{}, 1),
+		handlerLimit: make(chan struct{}, defaultMaxConcurrentHandlers()),
 	}
 	heap.Init(&s.heap)
 	return s
@@ -49,11 +57,6 @@ func NewSchedule() *Schedule {
 
 func (s *Schedule) Run(ctx context.Context) {
 	go s.Start(ctx)
-}
-
-// SetIntervalTime 仅为兼容保留，最小堆调度模型下不再依赖轮询间隔。
-func (s *Schedule) SetIntervalTime(v time.Duration) {
-	s.intervalTime = v
 }
 
 // Start 开始
@@ -97,13 +100,22 @@ func (s *Schedule) Start(ctx context.Context) {
 
 // Add 添加
 func (s *Schedule) Add(delayHandler DelayHandler, duration time.Duration, persistence bool) (TID uint64) {
+	if isNilDelayHandler(delayHandler) {
+		return 0
+	}
 	if duration < 0 {
 		duration = 0
 	}
+	if duration == 0 {
+		persistence = false
+	}
+	if persistence && duration < minRecurringDuration {
+		return 0
+	}
 
 	s.mutex.Lock()
-	s.IDGen++
-	TID = s.IDGen
+	s.idGen++
+	TID = s.idGen
 	ev := &event{
 		id:           TID,
 		endTime:      time.Now().Add(duration),
@@ -156,13 +168,16 @@ func (s *Schedule) AddMonthly(delayHandler DelayHandler, day, hour, minute, seco
 }
 
 func (s *Schedule) addCalendarDate(delayHandler DelayHandler, first time.Time, persistence bool, next func(time.Time) time.Time) (TID uint64) {
+	if isNilDelayHandler(delayHandler) {
+		return 0
+	}
 	if first.Before(time.Now()) {
 		first = time.Now()
 	}
 
 	s.mutex.Lock()
-	s.IDGen++
-	TID = s.IDGen
+	s.idGen++
+	TID = s.idGen
 	ev := &event{
 		id:           TID,
 		endTime:      first,
@@ -227,7 +242,7 @@ func daysInMonth(year int, month time.Month) int {
 	return time.Date(year, month+1, 0, 0, 0, 0, 0, time.UTC).Day()
 }
 
-// Remove 移除
+// Remove 移除  备注：只保证取消未触发，不保证取消已经到期的触发
 func (s *Schedule) Remove(id uint64) {
 	s.mutex.Lock()
 	if ev, ok := s.events[id]; ok {
@@ -242,15 +257,23 @@ func (s *Schedule) Remove(id uint64) {
 
 // Surplus 剩余
 func (s *Schedule) Surplus(id uint64) (duration time.Duration) {
+	duration, _ = s.SurplusOK(id)
+	return
+}
+
+// SurplusOK 返回任务剩余时间，并通过 ok 区分任务是否存在。
+func (s *Schedule) SurplusOK(id uint64) (duration time.Duration, ok bool) {
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
-	if ev, ok := s.events[id]; ok {
-		duration = ev.endTime.Sub(time.Now())
+	ev, ok := s.events[id]
+	if !ok {
+		return 0, false
 	}
+	duration = ev.endTime.Sub(time.Now())
 	if duration < 0 {
 		duration = 0
 	}
-	return
+	return duration, true
 }
 
 func (s *Schedule) nextWait() time.Duration {
@@ -290,8 +313,18 @@ func (s *Schedule) fireDue() {
 	s.mutex.Unlock()
 
 	for _, handler := range handlers {
-		go safeCall(handler)
+		s.callHandler(handler)
 	}
+}
+
+func (s *Schedule) callHandler(handler DelayHandler) {
+	s.handlerLimit <- struct{}{}
+	go func() {
+		defer func() {
+			<-s.handlerLimit
+		}()
+		safeCall(handler)
+	}()
 }
 
 func (s *Schedule) scheduleNextLocked(ev *event, now time.Time) {
@@ -303,14 +336,28 @@ func (s *Schedule) scheduleNextLocked(ev *event, now time.Time) {
 		}
 		ev.endTime = next
 	case ev.duration > 0:
-		next := ev.endTime.Add(ev.duration)
-		for !next.After(now) {
-			next = next.Add(ev.duration)
-		}
-		ev.endTime = next
+		ev.endTime = nextIntervalTime(ev.endTime, now, ev.duration)
 	default:
 		ev.endTime = now
 	}
+}
+
+func nextIntervalTime(last, now time.Time, interval time.Duration) time.Time {
+	if interval <= 0 {
+		return now
+	}
+	if next := last.Add(interval); next.After(now) {
+		return next
+	}
+
+	elapsed := now.Sub(last)
+	const maxDuration = time.Duration(1<<63 - 1)
+	if elapsed > maxDuration-interval {
+		return now.Add(interval)
+	}
+
+	steps := elapsed/interval + 1
+	return last.Add(steps * interval)
 }
 
 func (s *Schedule) pushEventLocked(ev *event) {
@@ -328,10 +375,31 @@ func (s *Schedule) notify() {
 func safeCall(d DelayHandler) {
 	defer func() {
 		if err := recover(); err != nil {
-			fmt.Println(err)
+			fmt.Fprintf(os.Stderr, "schedule: handler panic: %v\n%s\n", err, debug.Stack())
 		}
 	}()
 	d.OnTimer()
+}
+
+func isNilDelayHandler(delayHandler DelayHandler) bool {
+	if delayHandler == nil {
+		return true
+	}
+	v := reflect.ValueOf(delayHandler)
+	switch v.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Ptr, reflect.Slice:
+		return v.IsNil()
+	default:
+		return false
+	}
+}
+
+func defaultMaxConcurrentHandlers() int {
+	n := runtime.GOMAXPROCS(0) * 10
+	if n < 4 {
+		return 4
+	}
+	return n
 }
 
 func resetTimer(timer *time.Timer, wait time.Duration) {
