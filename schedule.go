@@ -395,7 +395,7 @@ func isNilDelayHandler(delayHandler DelayHandler) bool {
 }
 
 func defaultMaxConcurrentHandlers() int {
-	n := runtime.GOMAXPROCS(0) * 10
+	n := runtime.GOMAXPROCS(0) * 100
 	if n < 4 {
 		return 4
 	}
